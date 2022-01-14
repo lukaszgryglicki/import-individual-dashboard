@@ -10,12 +10,21 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
-var gDebugSQL bool
+var (
+	gDebugSQL           bool
+	gMtx                *sync.Mutex
+	gUpdatedIdentities  map[string]struct{}
+	gUpdatedUIdentities map[string]struct{}
+	gUpdatedProfiles    map[string]struct{}
+	gIDMtx              map[string]*sync.Mutex
+	gUUIDMtx            map[string]*sync.Mutex
+)
 
 func fatalOnError(err error) {
 	if err != nil {
@@ -57,7 +66,7 @@ func query(db *sql.DB, query string, args ...interface{}) (*sql.Rows, error) {
 	return rows, err
 }
 
-func exec(db *sql.DB, skip, query string, args ...interface{}) (sql.Result, error) {
+func exec(db *sql.Tx, skip, query string, args ...interface{}) (sql.Result, error) {
 	res, err := db.Exec(query, args...)
 	if err != nil || gDebugSQL {
 		if skip == "" || !strings.Contains(err.Error(), skip) || gDebugSQL {
@@ -108,11 +117,11 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 		err = fmt.Errorf("identity_id cannot be empty in %v", row)
 		return
 	}
-	rows, err := query(db, "select trim(coalesce(name, '')), trim(coalesce(username, '')), trim(coalesce(email, '')), trim(source) from identities where id = ?", id)
+	rows, err := query(db, "select uuid, trim(coalesce(name, '')), trim(coalesce(username, '')), trim(coalesce(email, '')), trim(source) from identities where id = ?", id)
 	fatalOnError(err)
-	name, username, email, source, found := "", "", "", "", false
+	uuid, name, username, email, source, found := "", "", "", "", "", false
 	for rows.Next() {
-		fatalOnError(rows.Scan(&name, &username, &email, &source))
+		fatalOnError(rows.Scan(&uuid, &name, &username, &email, &source))
 		found = true
 		break
 	}
@@ -121,7 +130,7 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 		return
 	}
 	if dbg {
-		fmt.Printf("Found: (%s,%s,%s,%s)\n", name, username, email, source)
+		fmt.Printf("Found: (%s,%s,%s,%s,%s)\n", uuid, name, username, email, source)
 	}
 	newName, _ := row["identity_name"]
 	newUsername, _ := row["identity_username"]
@@ -131,18 +140,49 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 	newUsername = strings.TrimSpace(newUsername)
 	newEmail = strings.TrimSpace(newEmail)
 	if source != newSource {
-		err = fmt.Errorf("identity_id %s updating source is not supported, attempted %s -> %s in %v", id, source, newSource, row)
+		err = fmt.Errorf("identity_id %s/%s updating source is not supported, attempted %s -> %s in %v", id, uuid, source, newSource, row)
 		return
 	}
 	if name == newName && username == newUsername && email == newEmail {
 		if dbg {
-			fmt.Printf("identity_id %s (%s,%s,%s) nothing changed in %v\n", id, name, username, email, row)
+			fmt.Printf("identity_id %s/%s (%s,%s,%s) nothing changed in %v\n", id, uuid, name, username, email, row)
 		}
 		return
 	}
+	// Concurrecncy check
+	if gMtx != nil {
+		// Lock working on identity ID
+		gMtx.Lock()
+		mtx, found := gIDMtx[id]
+		gMtx.Unlock()
+		if !found {
+			mtx = &sync.Mutex{}
+			gMtx.Lock()
+			gIDMtx[id] = mtx
+			gMtx.Unlock()
+		} else if dbg {
+			fmt.Printf("Duplicate id %s found in %v\n", id, row)
+		}
+		mtx.Lock()
+		defer mtx.Unlock()
+		// Lock working on uidentity/profile UUID
+		gMtx.Lock()
+		umtx, found := gUUIDMtx[uuid]
+		gMtx.Unlock()
+		if !found {
+			umtx = &sync.Mutex{}
+			gMtx.Lock()
+			gUUIDMtx[uuid] = umtx
+			gMtx.Unlock()
+		} else if dbg {
+			fmt.Printf("Duplicate uuid %s found in %v\n", uuid, row)
+		}
+		umtx.Lock()
+		defer umtx.Unlock()
+	}
 	args := []interface{}{}
 	query := "update identities set "
-	msg := "identity_id " + id + " "
+	msg := "identity_id " + id + "/" + uuid + " "
 	if newName != name {
 		query += "name = ?, "
 		args = append(args, newName)
@@ -173,20 +213,97 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 		}
 		return
 	}
-	var res sql.Result
-	res, err = exec(db, "1062: Duplicate entry", query, args...)
+	// Actual updates
+	var (
+		affectedI int64
+		affectedP int64
+		affectedU int64
+		tx        *sql.Tx
+		res       sql.Result
+	)
+	tx, err = db.Begin()
 	if err != nil {
-		err = fmt.Errorf("error %v for (%s,%v) for row %v", err, query, args, row)
+		err = fmt.Errorf("error starting transaction %v for row %v", err, row)
 		return
 	}
-	var affected int64
-	affected, err = res.RowsAffected()
+	defer func() {
+		if tx != nil {
+			fmt.Printf("rollback %s\n", msg)
+			_ = tx.Rollback()
+		}
+	}()
+	// Update identities
+	skip := "Error 1062"
+	res, err = exec(tx, skip, query, args...)
+	if err != nil {
+		if strings.Contains(err.Error(), skip) {
+			err = nil
+			if !dbg {
+				fmt.Printf("%s: collision\n", msg)
+			}
+			return
+		}
+		err = fmt.Errorf("error updating identities %v for (%s,%v) for row %v", err, query, args, row)
+		return
+	}
+	affectedI, err = res.RowsAffected()
 	if err != nil {
 		err = fmt.Errorf("error getting affected rows count %v for (%s,%v) for row %v", err, query, args, row)
 		return
 	}
-	if affected <= 0 || dbg {
-		fmt.Printf("%s: affected %d rows\n", msg, affected)
+	if affectedI <= 0 || dbg {
+		fmt.Printf("%s: affected %d identities rows\n", msg, affectedI)
+	}
+	// Update uidentities
+	res, err = exec(tx, "", "update uidentities set last_modified = now(), last_modified_by = ?, locked_by = ? where uuid = ?", who, "individual", uuid)
+	if err != nil {
+		err = fmt.Errorf("error updating uidentities %v for uuid %s for row %v", err, uuid, row)
+		return
+	}
+	affectedU, err = res.RowsAffected()
+	if err != nil {
+		err = fmt.Errorf("error getting affected rows count %v for uuid %s for row %v", err, uuid, row)
+		return
+	}
+	if affectedU <= 0 || dbg {
+		fmt.Printf("%s: affected %d uidentities rows\n", msg, affectedU)
+	}
+	// Update profiles
+	res, err = exec(tx, "", "update profiles set last_modified = now(), last_modified_by = ?, locked_by = ? where uuid = ?", who, "individual", uuid)
+	if err != nil {
+		err = fmt.Errorf("error updating profiles %v for uuid %s for row %v", err, uuid, row)
+		return
+	}
+	affectedP, err = res.RowsAffected()
+	if err != nil {
+		err = fmt.Errorf("error getting affected rows count %v for uuid %s for row %v", err, uuid, row)
+		return
+	}
+	if affectedP <= 0 || dbg {
+		fmt.Printf("%s: affected %d profiles rows\n", msg, affectedU)
+	}
+	if affectedI <= 0 || affectedU <= 0 || affectedP <= 0 {
+		fmt.Printf("WARNING: %s: didn't affect identities or uidentities or profiles: (%d,%d,%d)\n", msg, affectedI, affectedU, affectedP)
+		return
+	}
+	err = tx.Commit()
+	if err != nil {
+		err = fmt.Errorf("error committing transaction %v for row %v", err, row)
+		return
+	}
+	tx = nil
+	if gMtx != nil {
+		gMtx.Lock()
+		if affectedI > 0 {
+			gUpdatedIdentities[id] = struct{}{}
+		}
+		if affectedU > 0 {
+			gUpdatedUIdentities[uuid] = struct{}{}
+		}
+		if affectedP > 0 {
+			gUpdatedProfiles[uuid] = struct{}{}
+		}
+		gMtx.Unlock()
 	}
 	return
 }
@@ -205,9 +322,12 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 }
 
 func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
+	gUpdatedIdentities = make(map[string]struct{})
+	gUpdatedUIdentities = make(map[string]struct{})
+	gUpdatedProfiles = make(map[string]struct{})
+	gDebugSQL = os.Getenv("DEBUG_SQL") != ""
 	dbg := os.Getenv("DEBUG") != ""
 	dry := os.Getenv("DRY") != ""
-	gDebugSQL = os.Getenv("DEBUG_SQL") != ""
 	identitiesFile := fileNames[0]
 	affiliationsFile := fileNames[1]
 	fmt.Printf("Importing: %s, %s files\n", identitiesFile, affiliationsFile)
@@ -228,6 +348,11 @@ func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
 		_ = fileAffiliations.Close()
 	}()
 	thrN := getThreadsNum()
+	if thrN > 1 {
+		gMtx = &sync.Mutex{}
+		gIDMtx = make(map[string]*sync.Mutex)
+		gUUIDMtx = make(map[string]*sync.Mutex)
+	}
 	// Identities CSV data
 	var identitiesLines [][]string
 	identitiesLines, err = csv.NewReader(fileIdentities).ReadAll()
@@ -301,6 +426,7 @@ func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
 			}
 		}
 	}
+	fmt.Printf("Updated %d identities, %d uidentities, %d profiles\n", len(gUpdatedIdentities), len(gUpdatedUIdentities), len(gUpdatedProfiles))
 
 	// Enrollments/Affiliations
 	hdr = []string{}

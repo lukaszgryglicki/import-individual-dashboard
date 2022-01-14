@@ -1,10 +1,10 @@
 GO_BIN_FILES=import.go
 GO_BIN_CMDS=import
 #for race CGO_ENABLED=1
-#GO_ENV=CGO_ENABLED=1
-GO_ENV=CGO_ENABLED=0
-#GO_BUILD=go build -ldflags '-s -w' -race
-GO_BUILD=go build -ldflags '-s -w'
+GO_ENV=CGO_ENABLED=1
+#GO_ENV=CGO_ENABLED=0
+GO_BUILD=go build -ldflags '-s -w' -race
+#GO_BUILD=go build -ldflags '-s -w'
 GO_INSTALL=go install -ldflags '-s'
 GO_FMT=gofmt -s -w
 GO_LINT=golint -set_exit_status

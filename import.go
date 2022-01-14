@@ -108,7 +108,7 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 		err = fmt.Errorf("identity_id cannot be empty in %v", row)
 		return
 	}
-	rows, err := query(db, "select coalesce(name, ''), coalesce(username, ''), coalesce(email, ''), source from identities where id = ?", id)
+	rows, err := query(db, "select trim(coalesce(name, '')), trim(coalesce(username, '')), trim(coalesce(email, '')), trim(source) from identities where id = ?", id)
 	fatalOnError(err)
 	name, username, email, source, found := "", "", "", "", false
 	for rows.Next() {
@@ -123,7 +123,71 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 	if dbg {
 		fmt.Printf("Found: (%s,%s,%s,%s)\n", name, username, email, source)
 	}
-	fmt.Printf("ok\n")
+	newName, _ := row["identity_name"]
+	newUsername, _ := row["identity_username"]
+	newEmail, _ := row["identity_email"]
+	newSource, _ := row["identity_source"]
+	newName = strings.TrimSpace(newName)
+	newUsername = strings.TrimSpace(newUsername)
+	newEmail = strings.TrimSpace(newEmail)
+	if source != newSource {
+		err = fmt.Errorf("identity_id %s updating source is not supported, attempted %s -> %s in %v", id, source, newSource, row)
+		return
+	}
+	if name == newName && username == newUsername && email == newEmail {
+		if dbg {
+			fmt.Printf("identity_id %s (%s,%s,%s) nothing changed in %v\n", id, name, username, email, row)
+		}
+		return
+	}
+	args := []interface{}{}
+	query := "update identities set "
+	msg := "identity_id " + id + " "
+	if newName != name {
+		query += "name = ?, "
+		args = append(args, newName)
+		msg += "name " + name + " -> " + newName + " "
+	}
+	if newUsername != username {
+		query += "username = ?, "
+		args = append(args, newUsername)
+		msg += "username " + username + " -> " + newUsername + " "
+	}
+	if newEmail != email {
+		query += "email = ?, "
+		args = append(args, newEmail)
+		msg += "email " + email + " -> " + newEmail + " "
+	}
+	query += "last_modified = now(), last_modified_by = ?, locked_by = ? where id = ?"
+	userSFID, _ := row["user_sfid"]
+	userEmail, _ := row["user_email"]
+	userSFID = strings.TrimSpace(userSFID)
+	userEmail = strings.TrimSpace(userEmail)
+	who := "email:" + userEmail + ",sfid:" + userSFID
+	msg += " by " + who
+	args = append(args, who, "individual", id)
+	if dry {
+		fmt.Printf("%s\n", msg)
+		if dbg {
+			fmt.Printf("(%s,%v)\n", query, args)
+		}
+		return
+	}
+	var res sql.Result
+	res, err = exec(db, "1062: Duplicate entry", query, args...)
+	if err != nil {
+		err = fmt.Errorf("error %v for (%s,%v) for row %v", err, query, args, row)
+		return
+	}
+	var affected int64
+	affected, err = res.RowsAffected()
+	if err != nil {
+		err = fmt.Errorf("error getting affected rows count %v for (%s,%v) for row %v", err, query, args, row)
+		return
+	}
+	if affected <= 0 || dbg {
+		fmt.Printf("%s: affected %d rows\n", msg, affected)
+	}
 	return
 }
 

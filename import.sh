@@ -1,5 +1,5 @@
 #!/bin/bash
-# DEBUG=1 DRY='' DEBUG_SQL=1 ./import.sh prod
+# NCPUS=12 DEBUG=1 DRY='' DEBUG_SQL=1 ./import.sh prod
 if [ -z "$1" ]
 then
   echo "$0: you need to specify env: test|prod"

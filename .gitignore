@@ -23,7 +23,7 @@ sortinghat.sql
 .mailmap
 
 # Go binary
-import-identities
+import
 
 # Others
 out

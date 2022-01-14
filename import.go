@@ -93,13 +93,60 @@ func getThreadsNum() int {
 	return nCPUs
 }
 
+func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]string) (err error) {
+	// action identity_id identity_name identity_username identity_email identity_source user_sfid user_email
+	if ch != nil {
+		defer func() {
+			ch <- err
+		}()
+	}
+	if dbg {
+		fmt.Printf("%v\n", row)
+	}
+	id, _ := row["identity_id"]
+	if id == "" {
+		err = fmt.Errorf("identity_id cannot be empty in %v", row)
+		return
+	}
+	rows, err := query(db, "select coalesce(name, ''), coalesce(username, ''), coalesce(email, ''), source from identities where id = ?", id)
+	fatalOnError(err)
+	name, username, email, source, found := "", "", "", "", false
+	for rows.Next() {
+		fatalOnError(rows.Scan(&name, &username, &email, &source))
+		found = true
+		break
+	}
+	if !found {
+		fmt.Printf("WARNING: cannot find identity with id=%s (row %v)\n", id, row)
+		return
+	}
+	if dbg {
+		fmt.Printf("Found: (%s,%s,%s,%s)\n", name, username, email, source)
+	}
+	fmt.Printf("ok\n")
+	return
+}
+
+func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]string) (err error) {
+	if ch != nil {
+		defer func() {
+			ch <- err
+		}()
+	}
+	// action identity_id user_sfid user_name user_email project_slug project_id project_name to_org_name to_start_date to_end_date from_org_name from_start_date from_end_date
+	if dbg {
+		fmt.Printf("%v\n", row)
+	}
+	return
+}
+
 func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
 	dbg := os.Getenv("DEBUG") != ""
 	dry := os.Getenv("DRY") != ""
 	gDebugSQL = os.Getenv("DEBUG_SQL") != ""
 	identitiesFile := fileNames[0]
 	affiliationsFile := fileNames[1]
-	fmt.Printf("Importing (%s,%s)\n", identitiesFile, affiliationsFile)
+	fmt.Printf("Importing: %s, %s files\n", identitiesFile, affiliationsFile)
 	var fileIdentities *os.File
 	fileIdentities, err = os.Open(identitiesFile)
 	if err != nil {
@@ -116,63 +163,138 @@ func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
 	defer func() {
 		_ = fileAffiliations.Close()
 	}()
+	thrN := getThreadsNum()
+	// Identities CSV data
 	var identitiesLines [][]string
 	identitiesLines, err = csv.NewReader(fileIdentities).ReadAll()
 	if err != nil {
 		return
 	}
-	// action identity_id identity_name identity_username identity_email identity_source user_sfid user_email
-	hdr := []string{}
-	for i, line := range identitiesLines {
-		if i == 0 {
-			for _, col := range line {
-				hdr = append(hdr, col)
-			}
-			if dbg {
-				fmt.Printf("%s\n", hdr)
-			}
-			continue
-		}
-		row := map[string]string{}
-		for c, col := range line {
-			row[hdr[c]] = col
-		}
-		if dbg {
-			fmt.Printf("%v\n", row)
-		}
-	}
-	var affiliationsLines [][]string
-	affiliationsLines, err = csv.NewReader(fileAffiliations).ReadAll()
+
+	// Enrollments/Affiliations CSV data
+	var enrollmentsLines [][]string
+	enrollmentsLines, err = csv.NewReader(fileAffiliations).ReadAll()
 	if err != nil {
 		return
 	}
-	// action identity_id user_sfid user_name user_email project_slug project_id project_name to_org_name to_start_date to_end_date from_org_name from_start_date from_end_date
-	hdr = []string{}
-	for i, line := range affiliationsLines {
-		if i == 0 {
-			for _, col := range line {
-				hdr = append(hdr, col)
+
+	// Identities
+	hdr := []string{}
+	ch := make(chan error)
+	if thrN > 1 {
+		nThreads := 0
+		for i, line := range identitiesLines {
+			if i == 0 {
+				for _, col := range line {
+					hdr = append(hdr, col)
+				}
+				if dbg {
+					fmt.Printf("Identities header: %s\n", hdr)
+				}
+				continue
 			}
-			if dbg {
-				fmt.Printf("%s\n", hdr)
+			row := map[string]string{}
+			for c, col := range line {
+				row[hdr[c]] = col
 			}
-			continue
+			go func() {
+				_ = updateIdentity(ch, db, dbg, dry, row)
+			}()
+			nThreads++
+			if nThreads == thrN {
+				err = <-ch
+				nThreads--
+				if err != nil {
+					return
+				}
+			}
 		}
-		row := map[string]string{}
-		for c, col := range line {
-			row[hdr[c]] = col
+		for nThreads > 0 {
+			err = <-ch
+			nThreads--
+			if err != nil {
+				return
+			}
 		}
-		if dbg {
-			fmt.Printf("%v\n", row)
+	} else {
+		for i, line := range identitiesLines {
+			if i == 0 {
+				for _, col := range line {
+					hdr = append(hdr, col)
+				}
+				if dbg {
+					fmt.Printf("Identities header: %s\n", hdr)
+				}
+				continue
+			}
+			row := map[string]string{}
+			for c, col := range line {
+				row[hdr[c]] = col
+			}
+			err = updateIdentity(nil, db, dbg, dry, row)
+			if err != nil {
+				return
+			}
 		}
 	}
-	if !dry {
-		rows, err := query(db, "select 'hello'")
-		fatalOnError(err)
-		str := ""
-		for rows.Next() {
-			fatalOnError(rows.Scan(&str))
-			fmt.Printf("%s\n", str)
+
+	// Enrollments/Affiliations
+	hdr = []string{}
+	ch = make(chan error)
+	if thrN > 1 {
+		nThreads := 0
+		for i, line := range enrollmentsLines {
+			if i == 0 {
+				for _, col := range line {
+					hdr = append(hdr, col)
+				}
+				if dbg {
+					fmt.Printf("Enrollments header: %s\n", hdr)
+				}
+				continue
+			}
+			row := map[string]string{}
+			for c, col := range line {
+				row[hdr[c]] = col
+			}
+			go func() {
+				_ = updateEnrollment(ch, db, dbg, dry, row)
+			}()
+			nThreads++
+			if nThreads == thrN {
+				err = <-ch
+				nThreads--
+				if err != nil {
+					return
+				}
+			}
+		}
+		for nThreads > 0 {
+			err = <-ch
+			nThreads--
+			if err != nil {
+				return
+			}
+		}
+	} else {
+		for i, line := range enrollmentsLines {
+			if i == 0 {
+				for _, col := range line {
+					hdr = append(hdr, col)
+				}
+				if dbg {
+					fmt.Printf("Enrollments header: %s\n", hdr)
+				}
+				continue
+			}
+			row := map[string]string{}
+			for c, col := range line {
+				row[hdr[c]] = col
+			}
+			err = updateEnrollment(nil, db, dbg, dry, row)
+			if err != nil {
+				return
+			}
 		}
 	}
 	return

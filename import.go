@@ -24,6 +24,7 @@ var (
 	gDebugSQL           bool
 	gMtx                *sync.Mutex
 	gUpdatedIdentities  map[string]struct{}
+	gUpdatedEnrollments map[string]struct{}
 	gUpdatedUIdentities map[string]struct{}
 	gUpdatedProfiles    map[string]struct{}
 	gIDMtx              map[string]*sync.Mutex
@@ -236,9 +237,12 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 		err = fmt.Errorf("error starting transaction %v for row %v", err, row)
 		return
 	}
+	collision := false
 	defer func() {
 		if tx != nil {
-			fmt.Printf("rollback %s\n", msg)
+			if !collision || dbg {
+				fmt.Printf("rollback %s\n", msg)
+			}
 			_ = tx.Rollback()
 		}
 	}()
@@ -248,7 +252,8 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 	if err != nil {
 		if strings.Contains(err.Error(), skip) {
 			err = nil
-			if !dbg {
+			collision = true
+			if dbg {
 				fmt.Printf("%s: collision\n", msg)
 			}
 			return
@@ -400,6 +405,30 @@ func sfdcSlugToDASlug(db *sql.DB, dbg bool, sfdcSlug string) (daSlug string, err
 	return
 }
 
+func timeParseAny(dtStr string) (time.Time, error) {
+	formats := []string{
+		"2006-01-02T15:04:05Z",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02 15",
+		"2006-01-02",
+		"2006-01",
+		"2006",
+	}
+	for _, format := range formats {
+		t, e := time.Parse(format, dtStr)
+		if e == nil {
+			return t, nil
+		}
+	}
+	err := fmt.Errorf("cannot parse datetime: '%s'", dtStr)
+	return time.Now(), err
+}
+
+func toYMDDate(dt time.Time) string {
+	return fmt.Sprintf("%04d-%02d-%02d", dt.Year(), dt.Month(), dt.Day())
+}
+
 func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]string) (err error) {
 	// action identity_id user_sfid user_name user_email project_slug project_id project_name
 	// to_org_name to_start_date to_end_date from_org_name from_start_date from_end_date
@@ -435,10 +464,36 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 	}
 	orgName, _ := row["from_org_name"]
 	orgName = strings.TrimSpace(orgName)
+	var (
+		tStartDate    time.Time
+		tEndDate      time.Time
+		tNewStartDate time.Time
+		tNewEndDate   time.Time
+	)
 	startDate, _ := row["from_start_date"]
 	startDate = strings.TrimSpace(startDate)
+	if startDate != "" {
+		tStartDate, err = timeParseAny(startDate)
+		if err != nil {
+			err = fmt.Errorf("identity_id %s/%s cannot parse date %s %v", id, uuid, startDate, row)
+			return
+		}
+	} else {
+		tStartDate = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	startDate = toYMDDate(tStartDate)
 	endDate, _ := row["from_end_date"]
 	endDate = strings.TrimSpace(endDate)
+	if endDate != "" {
+		tEndDate, err = timeParseAny(endDate)
+		if err != nil {
+			err = fmt.Errorf("identity_id %s/%s cannot parse date %s %v", id, uuid, endDate, row)
+			return
+		}
+	} else {
+		tEndDate = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	endDate = toYMDDate(tEndDate)
 	newOrgName, _ := row["to_org_name"]
 	newOrgName = strings.TrimSpace(newOrgName)
 	if newOrgName == "" {
@@ -447,8 +502,28 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 	}
 	newStartDate, _ := row["to_start_date"]
 	newStartDate = strings.TrimSpace(newStartDate)
+	if newStartDate != "" {
+		tNewStartDate, err = timeParseAny(newStartDate)
+		if err != nil {
+			err = fmt.Errorf("identity_id %s/%s cannot parse date %s %v", id, uuid, newStartDate, row)
+			return
+		}
+	} else {
+		tNewStartDate = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	newStartDate = toYMDDate(tNewStartDate)
 	newEndDate, _ := row["to_end_date"]
 	newEndDate = strings.TrimSpace(newEndDate)
+	if newEndDate != "" {
+		tNewEndDate, err = timeParseAny(newEndDate)
+		if err != nil {
+			err = fmt.Errorf("identity_id %s/%s cannot parse date %s %v", id, uuid, newEndDate, row)
+			return
+		}
+	} else {
+		tNewEndDate = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	newEndDate = toYMDDate(tNewEndDate)
 	var (
 		orgID       int
 		newOrgID    int
@@ -506,17 +581,24 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 		if dbg {
 			fmt.Printf("WARNING: identity_id %s/%s error %v in row %v\n", id, uuid, err, row)
 		}
+		if gMtx != nil {
+			gMtx.Lock()
+		}
 		_, rep := gOrgMiss[newOrgName]
 		if !rep {
 			gOrgMiss[newOrgName] = struct{}{}
 			fmt.Printf("Organization not found in SH DB: %s\n", newOrgName)
+		}
+		if gMtx != nil {
+			gMtx.Unlock()
 		}
 		err = nil
 		return
 	}
 	// action identity_id user_sfid user_name user_email project_slug project_id project_name
 	// to_org_name to_start_date to_end_date from_org_name from_start_date from_end_date
-	eid, found := 0, false
+	// fmt.Printf("(%s,%s,%s,%s) (%v,%v,%v,%v)\n", startDate, endDate, newStartDate, newEndDate, tStartDate, tEndDate, tNewStartDate, tNewEndDate)
+	eid := 0
 	if orgName != "" {
 		// Update mode - we have
 		args := []interface{}{uuid, projectSlug, orgID}
@@ -529,17 +611,24 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 			q += " and end = str_to_date(?, ?)"
 			args = append(args, endDate, cDateTimeFormat)
 		}
+		found := 0
 		rows, err = query(db, q, args...)
 		fatalOnError(err)
 		for rows.Next() {
 			fatalOnError(rows.Scan(&eid))
-			found = true
-			break
+			found++
+			if found > 1 {
+				break
+			}
 		}
 		fatalOnError(rows.Err())
 		fatalOnError(rows.Close())
-		if !found {
+		if found == 0 {
 			fmt.Printf("WARNING: cannot find identity with uuid=%s project_slug=%s organization=%s/%d start=%s end=%s (row %v)\n", uuid, projectSlug, orgName, orgID, startDate, endDate, row)
+			return
+		}
+		if found > 1 {
+			fmt.Printf("WARNING: found more than one identities with uuid=%s project_slug=%s organization=%s/%d start=%s end=%s (row %v)\n", uuid, projectSlug, orgName, orgID, startDate, endDate, row)
 			return
 		}
 		if dbg {
@@ -586,9 +675,9 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 		defer umtx.Unlock()
 	}
 	args := []interface{}{}
-	query, msg := "", ""
+	query, msg, who := "", "", ""
 	if eid > 0 {
-		query := "update enrollments set "
+		query = "update enrollments set "
 		msg = fmt.Sprintf("enrollment %d identity_id %s/%s ", eid, id, uuid)
 		if newOrgID != orgID {
 			query += "organization_id = ?, "
@@ -612,7 +701,7 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 		userSFID = strings.TrimSpace(userSFID)
 		userName = strings.TrimSpace(userName)
 		userEmail = strings.TrimSpace(userEmail)
-		who := "email:" + userEmail + ",name:" + userName + ",sfid:" + userSFID
+		who = "email:" + userEmail + ",name:" + userName + ",sfid:" + userSFID
 		msg += " by " + who
 		args = append(args, who, "individual", id)
 	} else {
@@ -622,8 +711,8 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 		userSFID = strings.TrimSpace(userSFID)
 		userName = strings.TrimSpace(userName)
 		userEmail = strings.TrimSpace(userEmail)
-		who := "email:" + userEmail + ",name:" + userName + ",sfid:" + userSFID
-		query := "insert into enrollments(uuid, organization_id, project_slug, start, end, last_modified_by, locked_by) "
+		who = "email:" + userEmail + ",name:" + userName + ",sfid:" + userSFID
+		query = "insert into enrollments(uuid, organization_id, project_slug, start, end, last_modified_by, locked_by) "
 		query += "values(?, ?, ?, str_to_date(?, ?), str_to_date(?, ?), ?, ?)"
 		args = append(args, uuid, newOrgID, projectSlug, newStartDate, cDateTimeFormat, newEndDate, cDateTimeFormat, who, "individual")
 		msg = fmt.Sprintf("new enrollment identity_id %s/%s %s/%d %s %s %s by %s", id, uuid, newOrgName, newOrgID, projectSlug, newStartDate, newEndDate, who)
@@ -635,104 +724,107 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 		}
 		return
 	}
-	/*
-		// Actual updates
-		var (
-			affectedI int64
-			affectedP int64
-			affectedU int64
-			tx        *sql.Tx
-			res       sql.Result
-		)
-		tx, err = db.Begin()
-		if err != nil {
-			err = fmt.Errorf("error starting transaction %v for row %v", err, row)
-			return
-		}
-		defer func() {
-			if tx != nil {
+	// Actual updates
+	var (
+		affectedE int64
+		affectedP int64
+		affectedU int64
+		tx        *sql.Tx
+		res       sql.Result
+	)
+	tx, err = db.Begin()
+	if err != nil {
+		err = fmt.Errorf("error starting transaction %v for row %v", err, row)
+		return
+	}
+	collision := false
+	defer func() {
+		if tx != nil {
+			if !collision || dbg {
 				fmt.Printf("rollback %s\n", msg)
-				_ = tx.Rollback()
 			}
-		}()
-		// Update identities
-		skip := "Error 1062"
-		res, err = exec(tx, skip, query, args...)
-		if err != nil {
-			if strings.Contains(err.Error(), skip) {
-				err = nil
-				if !dbg {
-					fmt.Printf("%s: collision\n", msg)
-				}
-				return
+			_ = tx.Rollback()
+		}
+	}()
+	// Update/Insert enrollments
+	skip := "Error 1062"
+	res, err = exec(tx, skip, query, args...)
+	if err != nil {
+		if strings.Contains(err.Error(), skip) {
+			err = nil
+			collision = true
+			if dbg {
+				fmt.Printf("%s: collision\n", msg)
 			}
-			err = fmt.Errorf("error updating identities %v for (%s,%v) for row %v", err, query, args, row)
 			return
 		}
-		affectedI, err = res.RowsAffected()
-		if err != nil {
-			err = fmt.Errorf("error getting affected rows count %v for (%s,%v) for row %v", err, query, args, row)
-			return
+		err = fmt.Errorf("error updating/adding enrollments %v for (%s,%v) for row %v", err, query, args, row)
+		return
+	}
+	affectedE, err = res.RowsAffected()
+	if err != nil {
+		err = fmt.Errorf("error getting affected rows count %v for (%s,%v) for row %v", err, query, args, row)
+		return
+	}
+	if affectedE <= 0 || dbg {
+		fmt.Printf("%s: affected %d enrollments rows\n", msg, affectedE)
+	}
+	// Update uidentities
+	res, err = exec(tx, "", "update uidentities set last_modified = now(), last_modified_by = ?, locked_by = ? where uuid = ?", who, "individual", uuid)
+	if err != nil {
+		err = fmt.Errorf("error updating uidentities %v for uuid %s for row %v", err, uuid, row)
+		return
+	}
+	affectedU, err = res.RowsAffected()
+	if err != nil {
+		err = fmt.Errorf("error getting affected rows count %v for uuid %s for row %v", err, uuid, row)
+		return
+	}
+	if affectedU <= 0 || dbg {
+		fmt.Printf("%s: affected %d uidentities rows\n", msg, affectedU)
+	}
+	// Update profiles
+	res, err = exec(tx, "", "update profiles set last_modified = now(), last_modified_by = ?, locked_by = ? where uuid = ?", who, "individual", uuid)
+	if err != nil {
+		err = fmt.Errorf("error updating profiles %v for uuid %s for row %v", err, uuid, row)
+		return
+	}
+	affectedP, err = res.RowsAffected()
+	if err != nil {
+		err = fmt.Errorf("error getting affected rows count %v for uuid %s for row %v", err, uuid, row)
+		return
+	}
+	if affectedP <= 0 || dbg {
+		fmt.Printf("%s: affected %d profiles rows\n", msg, affectedU)
+	}
+	if affectedE <= 0 || affectedU <= 0 || affectedP <= 0 {
+		fmt.Printf("WARNING: %s: didn't affect enrollments or uidentities or profiles: (%d,%d,%d)\n", msg, affectedE, affectedU, affectedP)
+		return
+	}
+	err = tx.Commit()
+	if err != nil {
+		err = fmt.Errorf("error committing transaction %v for row %v", err, row)
+		return
+	}
+	tx = nil
+	if gMtx != nil {
+		gMtx.Lock()
+		if affectedE > 0 {
+			gUpdatedEnrollments[id] = struct{}{}
 		}
-		if affectedI <= 0 || dbg {
-			fmt.Printf("%s: affected %d identities rows\n", msg, affectedI)
+		if affectedU > 0 {
+			gUpdatedUIdentities[uuid] = struct{}{}
 		}
-		// Update uidentities
-		res, err = exec(tx, "", "update uidentities set last_modified = now(), last_modified_by = ?, locked_by = ? where uuid = ?", who, "individual", uuid)
-		if err != nil {
-			err = fmt.Errorf("error updating uidentities %v for uuid %s for row %v", err, uuid, row)
-			return
+		if affectedP > 0 {
+			gUpdatedProfiles[uuid] = struct{}{}
 		}
-		affectedU, err = res.RowsAffected()
-		if err != nil {
-			err = fmt.Errorf("error getting affected rows count %v for uuid %s for row %v", err, uuid, row)
-			return
-		}
-		if affectedU <= 0 || dbg {
-			fmt.Printf("%s: affected %d uidentities rows\n", msg, affectedU)
-		}
-		// Update profiles
-		res, err = exec(tx, "", "update profiles set last_modified = now(), last_modified_by = ?, locked_by = ? where uuid = ?", who, "individual", uuid)
-		if err != nil {
-			err = fmt.Errorf("error updating profiles %v for uuid %s for row %v", err, uuid, row)
-			return
-		}
-		affectedP, err = res.RowsAffected()
-		if err != nil {
-			err = fmt.Errorf("error getting affected rows count %v for uuid %s for row %v", err, uuid, row)
-			return
-		}
-		if affectedP <= 0 || dbg {
-			fmt.Printf("%s: affected %d profiles rows\n", msg, affectedU)
-		}
-		if affectedI <= 0 || affectedU <= 0 || affectedP <= 0 {
-			fmt.Printf("WARNING: %s: didn't affect identities or uidentities or profiles: (%d,%d,%d)\n", msg, affectedI, affectedU, affectedP)
-			return
-		}
-		err = tx.Commit()
-		if err != nil {
-			err = fmt.Errorf("error committing transaction %v for row %v", err, row)
-			return
-		}
-		tx = nil
-		if gMtx != nil {
-			gMtx.Lock()
-			if affectedI > 0 {
-				gUpdatedIdentities[id] = struct{}{}
-			}
-			if affectedU > 0 {
-				gUpdatedUIdentities[uuid] = struct{}{}
-			}
-			if affectedP > 0 {
-				gUpdatedProfiles[uuid] = struct{}{}
-			}
-			gMtx.Unlock()
-		}
-	*/
+		gMtx.Unlock()
+	}
 	return
 }
 
 func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
+	gUpdatedEnrollments = make(map[string]struct{})
 	gUpdatedIdentities = make(map[string]struct{})
 	gUpdatedUIdentities = make(map[string]struct{})
 	gUpdatedProfiles = make(map[string]struct{})
@@ -906,6 +998,7 @@ func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
 			}
 		}
 	}
+	fmt.Printf("Updated %d enrollments, %d uidentities, %d profiles\n", len(gUpdatedEnrollments), len(gUpdatedUIdentities), len(gUpdatedProfiles))
 	return
 }
 

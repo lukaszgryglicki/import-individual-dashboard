@@ -29,7 +29,9 @@ var (
 	gIDMtx              map[string]*sync.Mutex
 	gUUIDMtx            map[string]*sync.Mutex
 	gOrgMap             map[string]int
+	gSlugMap            map[string]string
 	gOrgMiss            map[string]struct{}
+	gSlugMiss           map[string]struct{}
 )
 
 func fatalOnError(err error) {
@@ -131,6 +133,8 @@ func updateIdentity(ch chan error, db *sql.DB, dbg, dry bool, row map[string]str
 		found = true
 		break
 	}
+	fatalOnError(rows.Err())
+	fatalOnError(rows.Close())
 	if !found {
 		fmt.Printf("WARNING: cannot find identity with id=%s (row %v)\n", id, row)
 		return
@@ -325,7 +329,7 @@ func orgNameToID(db *sql.DB, dbg bool, orgName string) (orgID int, err error) {
 	}
 	if found {
 		if dbg {
-			fmt.Printf("found in cache %s -> %d\n", orgName, orgID)
+			fmt.Printf("org found in cache %s -> %d\n", orgName, orgID)
 		}
 		return
 	}
@@ -336,6 +340,8 @@ func orgNameToID(db *sql.DB, dbg bool, orgName string) (orgID int, err error) {
 		found = true
 		break
 	}
+	fatalOnError(rows.Err())
+	fatalOnError(rows.Close())
 	if !found {
 		err = fmt.Errorf("cannot find organization_id for %s", orgName)
 		return
@@ -348,7 +354,48 @@ func orgNameToID(db *sql.DB, dbg bool, orgName string) (orgID int, err error) {
 		gMtx.Unlock()
 	}
 	if dbg {
-		fmt.Printf("found in DB %s -> %d\n", orgName, orgID)
+		fmt.Printf("org found in DB %s -> %d\n", orgName, orgID)
+	}
+	return
+}
+
+func sfdcSlugToDASlug(db *sql.DB, dbg bool, sfdcSlug string) (daSlug string, err error) {
+	var found bool
+	if gMtx != nil {
+		gMtx.Lock()
+	}
+	daSlug, found = gSlugMap[sfdcSlug]
+	if gMtx != nil {
+		gMtx.Unlock()
+	}
+	if found {
+		if dbg {
+			fmt.Printf("slug found in cache %s -> %s\n", sfdcSlug, daSlug)
+		}
+		return
+	}
+	rows, e := query(db, "select da_name from slug_mapping where sf_name = ?", sfdcSlug)
+	fatalOnError(e)
+	for rows.Next() {
+		fatalOnError(rows.Scan(&daSlug))
+		found = true
+		break
+	}
+	fatalOnError(rows.Err())
+	fatalOnError(rows.Close())
+	if !found {
+		err = fmt.Errorf("cannot find DA slug for SFDC slug %s", sfdcSlug)
+		return
+	}
+	if gMtx != nil {
+		gMtx.Lock()
+	}
+	gSlugMap[sfdcSlug] = daSlug
+	if gMtx != nil {
+		gMtx.Unlock()
+	}
+	if dbg {
+		fmt.Printf("slug found in DB %s -> %s\n", sfdcSlug, daSlug)
 	}
 	return
 }
@@ -377,6 +424,8 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 		found = true
 		break
 	}
+	fatalOnError(rows.Err())
+	fatalOnError(rows.Close())
 	if !found {
 		fmt.Printf("WARNING: cannot find identity with id=%s (row %v)\n", id, row)
 		return
@@ -401,9 +450,34 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 	newEndDate, _ := row["to_end_date"]
 	newEndDate = strings.TrimSpace(newEndDate)
 	var (
-		orgID    int
-		newOrgID int
+		orgID       int
+		newOrgID    int
+		projectSlug string
 	)
+	sfdcProjectSlug, _ := row["project_slug"]
+	sfdcProjectSlug = strings.TrimSpace(sfdcProjectSlug)
+	if sfdcProjectSlug != "" {
+		projectSlug, err = sfdcSlugToDASlug(db, dbg, sfdcProjectSlug)
+		if err != nil {
+			// err = fmt.Errorf("identity_id %s/%s error %v in row %v", id, uuid, err, row)
+			if dbg {
+				fmt.Printf("WARNING: identity_id %s/%s error %v in row %v\n", id, uuid, err, row)
+			}
+			if gMtx != nil {
+				gMtx.Lock()
+			}
+			_, rep := gSlugMiss[sfdcProjectSlug]
+			if !rep {
+				gSlugMiss[sfdcProjectSlug] = struct{}{}
+				fmt.Printf("SFDC project slug not found in SH DB: %s\n", sfdcProjectSlug)
+			}
+			if gMtx != nil {
+				gMtx.Unlock()
+			}
+			err = nil
+			return
+		}
+	}
 	if orgName != "" {
 		orgID, err = orgNameToID(db, dbg, orgName)
 		if err != nil {
@@ -411,10 +485,16 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 			if dbg {
 				fmt.Printf("WARNING: identity_id %s/%s error %v in row %v\n", id, uuid, err, row)
 			}
+			if gMtx != nil {
+				gMtx.Lock()
+			}
 			_, rep := gOrgMiss[orgName]
 			if !rep {
 				gOrgMiss[orgName] = struct{}{}
 				fmt.Printf("Organization not found in SH DB: %s\n", orgName)
+			}
+			if gMtx != nil {
+				gMtx.Unlock()
 			}
 			err = nil
 			return
@@ -434,8 +514,6 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 		err = nil
 		return
 	}
-	projectSlug, _ := row["project_slug"]
-	projectSlug = strings.TrimSpace(projectSlug)
 	// action identity_id user_sfid user_name user_email project_slug project_id project_name
 	// to_org_name to_start_date to_end_date from_org_name from_start_date from_end_date
 	eid, found := 0, false
@@ -458,6 +536,8 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 			found = true
 			break
 		}
+		fatalOnError(rows.Err())
+		fatalOnError(rows.Close())
 		if !found {
 			fmt.Printf("WARNING: cannot find identity with uuid=%s project_slug=%s organization=%s/%d start=%s end=%s (row %v)\n", uuid, projectSlug, orgName, orgID, startDate, endDate, row)
 			return
@@ -474,71 +554,88 @@ func updateEnrollment(ch chan error, db *sql.DB, dbg, dry bool, row map[string]s
 		}
 		return
 	}
-	/*
-		// Concurrecncy check
-		if gMtx != nil {
-			// Lock working on identity ID
+	// Concurrecncy check
+	if gMtx != nil {
+		// Lock working on identity ID
+		gMtx.Lock()
+		mtx, found := gIDMtx[id]
+		gMtx.Unlock()
+		if !found {
+			mtx = &sync.Mutex{}
 			gMtx.Lock()
-			mtx, found := gIDMtx[id]
+			gIDMtx[id] = mtx
 			gMtx.Unlock()
-			if !found {
-				mtx = &sync.Mutex{}
-				gMtx.Lock()
-				gIDMtx[id] = mtx
-				gMtx.Unlock()
-			} else if dbg {
-				fmt.Printf("Duplicate id %s found in %v\n", id, row)
-			}
-			mtx.Lock()
-			defer mtx.Unlock()
-			// Lock working on uidentity/profile UUID
+		} else if dbg {
+			fmt.Printf("Duplicate id %s found in %v\n", id, row)
+		}
+		mtx.Lock()
+		defer mtx.Unlock()
+		// Lock working on uidentity/profile UUID
+		gMtx.Lock()
+		umtx, found := gUUIDMtx[uuid]
+		gMtx.Unlock()
+		if !found {
+			umtx = &sync.Mutex{}
 			gMtx.Lock()
-			umtx, found := gUUIDMtx[uuid]
+			gUUIDMtx[uuid] = umtx
 			gMtx.Unlock()
-			if !found {
-				umtx = &sync.Mutex{}
-				gMtx.Lock()
-				gUUIDMtx[uuid] = umtx
-				gMtx.Unlock()
-			} else if dbg {
-				fmt.Printf("Duplicate uuid %s found in %v\n", uuid, row)
-			}
-			umtx.Lock()
-			defer umtx.Unlock()
+		} else if dbg {
+			fmt.Printf("Duplicate uuid %s found in %v\n", uuid, row)
 		}
-		args := []interface{}{}
-		query := "update identities set "
-		msg := "identity_id " + id + "/" + uuid + " "
-		if newName != name {
-			query += "name = ?, "
-			args = append(args, newName)
-			msg += "name " + name + " -> " + newName + " "
+		umtx.Lock()
+		defer umtx.Unlock()
+	}
+	args := []interface{}{}
+	query, msg := "", ""
+	if eid > 0 {
+		query := "update enrollments set "
+		msg = fmt.Sprintf("enrollment %d identity_id %s/%s ", eid, id, uuid)
+		if newOrgID != orgID {
+			query += "organization_id = ?, "
+			args = append(args, newOrgName)
+			msg += fmt.Sprintf("org %s/%d -> %s/%d ", orgName, orgID, newOrgName, newOrgID)
 		}
-		if newUsername != username {
-			query += "username = ?, "
-			args = append(args, newUsername)
-			msg += "username " + username + " -> " + newUsername + " "
+		if newStartDate != startDate {
+			query += "start = str_to_date(?, ?), "
+			args = append(args, newStartDate, cDateTimeFormat)
+			msg += "start " + startDate + " -> " + newStartDate + " "
 		}
-		if newEmail != email {
-			query += "email = ?, "
-			args = append(args, newEmail)
-			msg += "email " + email + " -> " + newEmail + " "
+		if newEndDate != endDate {
+			query += "end = str_to_date(?, ?), "
+			args = append(args, newEndDate, cDateTimeFormat)
+			msg += "end " + endDate + " -> " + newEndDate + " "
 		}
 		query += "last_modified = now(), last_modified_by = ?, locked_by = ? where id = ?"
 		userSFID, _ := row["user_sfid"]
+		userName, _ := row["user_name"]
 		userEmail, _ := row["user_email"]
 		userSFID = strings.TrimSpace(userSFID)
+		userName = strings.TrimSpace(userName)
 		userEmail = strings.TrimSpace(userEmail)
-		who := "email:" + userEmail + ",sfid:" + userSFID
+		who := "email:" + userEmail + ",name:" + userName + ",sfid:" + userSFID
 		msg += " by " + who
 		args = append(args, who, "individual", id)
-		if dry {
-			fmt.Printf("%s\n", msg)
-			if dbg {
-				fmt.Printf("(%s,%v)\n", query, args)
-			}
-			return
+	} else {
+		userSFID, _ := row["user_sfid"]
+		userName, _ := row["user_name"]
+		userEmail, _ := row["user_email"]
+		userSFID = strings.TrimSpace(userSFID)
+		userName = strings.TrimSpace(userName)
+		userEmail = strings.TrimSpace(userEmail)
+		who := "email:" + userEmail + ",name:" + userName + ",sfid:" + userSFID
+		query := "insert into enrollments(uuid, organization_id, project_slug, start, end, last_modified_by, locked_by) "
+		query += "values(?, ?, ?, str_to_date(?, ?), str_to_date(?, ?), ?, ?)"
+		args = append(args, uuid, newOrgID, projectSlug, newStartDate, cDateTimeFormat, newEndDate, cDateTimeFormat, who, "individual")
+		msg = fmt.Sprintf("new enrollment identity_id %s/%s %s/%d %s %s %s by %s", id, uuid, newOrgName, newOrgID, projectSlug, newStartDate, newEndDate, who)
+	}
+	if dry {
+		fmt.Printf("%s\n", msg)
+		if dbg {
+			fmt.Printf("(%s,%v)\n", query, args)
 		}
+		return
+	}
+	/*
 		// Actual updates
 		var (
 			affectedI int64
@@ -640,7 +737,9 @@ func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
 	gUpdatedUIdentities = make(map[string]struct{})
 	gUpdatedProfiles = make(map[string]struct{})
 	gOrgMap = make(map[string]int)
+	gSlugMap = make(map[string]string)
 	gOrgMiss = make(map[string]struct{})
+	gSlugMiss = make(map[string]struct{})
 	gDebugSQL = os.Getenv("DEBUG_SQL") != ""
 	dbg := os.Getenv("DEBUG") != ""
 	dry := os.Getenv("DRY") != ""

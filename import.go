@@ -121,9 +121,24 @@ func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
 	if err != nil {
 		return
 	}
-	for _, line := range identitiesLines {
+	// action identity_id identity_name identity_username identity_email identity_source user_sfid user_email
+	hdr := []string{}
+	for i, line := range identitiesLines {
+		if i == 0 {
+			for _, col := range line {
+				hdr = append(hdr, col)
+			}
+			if dbg {
+				fmt.Printf("%s\n", hdr)
+			}
+			continue
+		}
+		row := map[string]string{}
+		for c, col := range line {
+			row[hdr[c]] = col
+		}
 		if dbg {
-			fmt.Printf("%s\n", line)
+			fmt.Printf("%v\n", row)
 		}
 	}
 	var affiliationsLines [][]string
@@ -131,9 +146,24 @@ func importCSVfiles(db *sql.DB, fileNames []string) (err error) {
 	if err != nil {
 		return
 	}
-	for _, line := range affiliationsLines {
+	// action identity_id user_sfid user_name user_email project_slug project_id project_name to_org_name to_start_date to_end_date from_org_name from_start_date from_end_date
+	hdr = []string{}
+	for i, line := range affiliationsLines {
+		if i == 0 {
+			for _, col := range line {
+				hdr = append(hdr, col)
+			}
+			if dbg {
+				fmt.Printf("%s\n", hdr)
+			}
+			continue
+		}
+		row := map[string]string{}
+		for c, col := range line {
+			row[hdr[c]] = col
+		}
 		if dbg {
-			fmt.Printf("%s\n", line)
+			fmt.Printf("%v\n", row)
 		}
 	}
 	if !dry {

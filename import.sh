@@ -12,4 +12,5 @@ then
   exit 2
 fi
 # ./import user_identities_202201061433.csv user_affiliations_202201061525.csv
-./import ui.csv ua.csv
+# ./import ui.csv ua.csv
+./import uie.csv user_affiliations_202201061525.csv
